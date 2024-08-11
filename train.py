@@ -10,6 +10,11 @@ from torch.utils.data import Dataset, DataLoader
 import os
 from sklearn.cluster import MiniBatchKMeans
 
+if torch.cuda.is_available():
+    device = "cuda"
+else: 
+    device = "cpu"
+
 class SpeechToSpeechDataset(Dataset):
     def __init__(self, 
                  audio_dir: str, 
@@ -60,15 +65,23 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(0)]
 
 class SpeechToSpeechLM(nn.Module):
-    def __init__(self, num_centroids: int, hidden_size: int, num_layers: int, dropout: float = 0.1):
+    def __init__(self, num_centroids: int, hidden_size: int, num_layers: int, dropout: float = 0.01):
         super(SpeechToSpeechLM, self).__init__()
         self.hubert = HubertModel(HubertConfig())
         self.kmeans = MiniBatchKMeans(n_clusters=num_centroids, batch_size=256)
         self.embedding = nn.Embedding(num_centroids, hidden_size)
         self.positional_encoding = PositionalEncoding(hidden_size)
+        
+        # Encoder
         encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=8, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        
+        # Decoder
+        decoder_layers = nn.TransformerDecoderLayer(d_model=hidden_size, nhead=8, dropout=dropout, batch_first=True)
+        self.decoder = nn.TransformerDecoder(decoder_layers, num_layers=num_layers)
+        
         self.fc = nn.Linear(hidden_size, num_centroids)
+
 
     def process_audio(self, audio_input: torch.Tensor) -> torch.Tensor:
         if audio_input.dim() == 3:
@@ -84,7 +97,7 @@ class SpeechToSpeechLM(nn.Module):
         features = self.hubert(audio_input).last_hidden_state
         return features
 
-    def forward(self, audio_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, audio_input: torch.Tensor, target_audio: Optional[torch.Tensor] = None) -> torch.Tensor:
         features = self.process_audio(audio_input)
         
         # Reshape features for clustering
@@ -101,16 +114,37 @@ class SpeechToSpeechLM(nn.Module):
         
         max_sequence_length = 1024
         if embedded.size(1) > max_sequence_length:
-            outputs = []
+            encoder_outputs = []
             for i in range(0, embedded.size(1), max_sequence_length):
                 chunk = embedded[:, i:i+max_sequence_length]
-                output = self.transformer(chunk)
-                outputs.append(output)
-            output = torch.cat(outputs, dim=1)
+                output = self.encoder(chunk)
+                encoder_outputs.append(output)
+            encoder_output = torch.cat(encoder_outputs, dim=1)
         else:
-            output = self.transformer(embedded)
+            encoder_output = self.encoder(embedded)
         
-        logits = self.fc(output)
+        if self.training and target_audio is not None:
+            target_features = self.process_audio(target_audio)
+            target_features_2d = target_features.view(-1, target_features.size(-1)).detach().cpu().numpy()
+            target_tokens = torch.tensor(self.kmeans.predict(target_features_2d), 
+                                         device=audio_input.device, dtype=torch.long)
+            target_tokens = target_tokens.view(target_features.size(0), target_features.size(1))
+            
+            target_embedded = self.embedding(target_tokens)
+            target_embedded = self.positional_encoding(target_embedded)
+            
+            decoder_output = self.decoder(target_embedded, encoder_output)
+        else:
+            # During inference, we need to generate output step by step
+            decoder_input = torch.zeros_like(encoder_output[:, :1])
+            decoder_outputs = []
+            for i in range(encoder_output.size(1)):
+                step_output = self.decoder(decoder_input, encoder_output)
+                decoder_outputs.append(step_output)
+                decoder_input = torch.cat([decoder_input, step_output[:, -1:]], dim=1)
+            decoder_output = torch.cat(decoder_outputs, dim=1)
+        
+        logits = self.fc(decoder_output)
         return logits
 
 def create_dataloader(audio_dir: str, 
@@ -128,26 +162,28 @@ def create_dataloader(audio_dir: str,
         pin_memory=True
     )
 
+
+
 if __name__ == "__main__":
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
         # Reduce the number of centroids to match the dataset size
-        num_centroids = 49  # In my case it's 49 n_samples, will add a dynamic handling
+        num_centroids = 49  # Changed from 100 to 50
 
-        model = SpeechToSpeechLM(num_centroids=num_centroids, hidden_size=768, num_layers=6).to(device)
+        model = SpeechToSpeechLM(num_centroids=num_centroids, hidden_size=768, num_layers=1).to(device)
 
         dataloader = create_dataloader(
             audio_dir="/mnt/e/Speech-to-Speech-LM/data",
-            batch_size=8,
+            batch_size=8,  # Increased from 1 to 8
             num_workers=4,
             sample_rate=16000,
             max_audio_length=16000
         )
 
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
         num_epochs = 10
         for epoch in range(num_epochs):
@@ -159,7 +195,7 @@ if __name__ == "__main__":
                 
                 optimizer.zero_grad()
                 
-                output = model(input_audio)
+                output = model(input_audio, target_audio)
                 
                 with torch.no_grad():
                     target_features = model.process_audio(target_audio)
