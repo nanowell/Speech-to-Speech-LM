@@ -1,2 +1,4 @@
 # Speech-to-Speech-LM
-Native Speech to Speech Language Model
+Task: 
+1. Make a Native Speech to Speech Language Model (training & inference)
+2. Handle Multi-GPU training.
