@@ -25,6 +25,11 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
         logits[indices_to_remove] = filter_value
     return logits
 
+def chunk_audio(audio: torch.Tensor, chunk_size: int = 30000, stride: int = 15000) -> torch.Tensor:
+    audio = audio.squeeze(0).squeeze(0)  # Remove batch and channel dimensions
+    chunks = audio.unfold(0, chunk_size, stride)
+    return chunks.unsqueeze(1).unsqueeze(1)  # Add batch and channel dimensions
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
@@ -53,17 +58,36 @@ class SpeechToSpeechLM(nn.Module):
         self.fc = nn.Linear(hidden_size, num_centroids)
 
     def process_audio(self, audio_input: torch.Tensor) -> torch.Tensor:
+        chunk_size = 30000  # Adjust this based on your HuBERT model's requirements
+        stride = 15000  # Adjust this for desired overlap
+
+        chunks = chunk_audio(audio_input, chunk_size, stride)
+        all_tokens = []
+
         with torch.no_grad():
-            features = self.hubert(audio_input).last_hidden_state
-            tokens = self.kmeans.predict(features.detach().cpu().numpy())
-            tokens = torch.tensor(tokens, device=audio_input.device, dtype=torch.long)
-        return tokens
+            for chunk in chunks:
+                features = self.hubert(chunk).last_hidden_state
+                tokens = self.kmeans.predict(features.detach().cpu().numpy())
+                all_tokens.extend(tokens)
+
+        return torch.tensor(all_tokens, device=audio_input.device, dtype=torch.long)
 
     def forward(self, audio_input: torch.Tensor) -> torch.Tensor:
         tokens = self.process_audio(audio_input)
         embedded = self.embedding(tokens)
         embedded = self.positional_encoding(embedded)
-        output = self.transformer(embedded)
+        
+        max_sequence_length = 1024  # Adjust based on your transformer's capacity
+        if embedded.size(1) > max_sequence_length:
+            outputs = []
+            for i in range(0, embedded.size(1), max_sequence_length):
+                chunk = embedded[:, i:i+max_sequence_length]
+                output = self.transformer(chunk)
+                outputs.append(output)
+            output = torch.cat(outputs, dim=1)
+        else:
+            output = self.transformer(embedded)
+        
         logits = self.fc(output)
         return logits
 
@@ -77,19 +101,25 @@ class SpeechToSpeechLM(nn.Module):
             input_embedded = self.embedding(tokens)
             input_embedded = self.positional_encoding(input_embedded)
             
+            max_sequence_length = 1024  # Should match the value in forward method
+            
             for _ in range(max_length):
-                if generated:
-                    prev_embedded = self.embedding(torch.tensor([generated[-1]], device=device)).unsqueeze(0)
-                    prev_embedded = self.positional_encoding(prev_embedded)
-                    input_embedded = torch.cat([input_embedded, prev_embedded], dim=1)
-                
-                output = self.transformer(input_embedded)
+                if input_embedded.size(1) > max_sequence_length:
+                    context = input_embedded[:, -max_sequence_length:]
+                else:
+                    context = input_embedded
+
+                output = self.transformer(context)
                 logits = self.fc(output[:, -1, :])
                 logits = logits / temperature
                 filtered_logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
                 probs = torch.softmax(filtered_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).item()
                 generated.append(next_token)
+
+                next_embedded = self.embedding(torch.tensor([next_token], device=device)).unsqueeze(0)
+                next_embedded = self.positional_encoding(next_embedded)
+                input_embedded = torch.cat([input_embedded, next_embedded], dim=1)
 
                 if len(generated) >= max_length:
                     break
@@ -123,63 +153,12 @@ class SpeechToSpeechLM(nn.Module):
         return model
 
 def preprocess_audio(audio_path: str, target_sample_rate: int = 16000) -> torch.Tensor:
-    audio, sample_rate = torchaudio.load(audio_path)
-    audio = audio.mean(dim=0, keepdim=True)  # Convert to mono if stereo
-    if sample_rate != target_sample_rate:
-        audio = torchaudio.functional.resample(audio, sample_rate, target_sample_rate)
-    return audio.unsqueeze(0)  # Add batch dimension
-
-# Example usage
-if __name__ == "__main__":
-    # Load pre-trained HuBERT model
-    hubert_model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
-
-    # Load your pre-trained k-means model (this is a placeholder)
-    kmeans_model = KMeans(n_clusters=100)
-    # kmeans_model.fit(...)  # You should fit this on HuBERT features from your training data
-
-    # Initialize the speech-to-speech LM
-    model = SpeechToSpeechLM(hubert_model, kmeans_model, num_centroids=100, hidden_size=768, num_layers=6)
-
-    # Preprocess audio
-    audio = preprocess_audio("path_to_audio_file.wav")
-
-    # Generate speech tokens
-    generated_tokens = model.generate(audio, max_length=100, temperature=0.8, top_k=50, top_p=0.95)
-
-    # Convert generated tokens to features (you'd need a vocoder to convert these to waveforms)
-    generated_features = model.tokens_to_features(generated_tokens)
-
-    print("Generated tokens:", generated_tokens)
-    print("Generated features shape:", generated_features.shape)
-
-    # Training loop (pseudo-code)
-    """
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    num_epochs = 10
-    for epoch in range(num_epochs):
-        for batch in dataloader:
-            audio_input, target_tokens = batch
-            optimizer.zero_grad()
-            loss = model.train_step(audio_input, target_tokens)
-            loss.backward()
-            optimizer.step()
-        
-        # Validation step
-        model.eval()
-        with torch.no_grad():
-            val_loss = 0
-            for val_batch in val_dataloader:
-                val_audio_input, val_target_tokens = val_batch
-                val_loss += model.train_step(val_audio_input, val_target_tokens)
-            val_loss /= len(val_dataloader)
-        model.train()
-        
-        print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {val_loss:.4f}")
-
-    # Save the model
-    model.save_checkpoint("speech_to_speech_model.pth")
-    """
-
-    # Load the model (example)
-    # loaded_model = SpeechToSpeechLM.load_checkpoint("speech_to_speech_model.pth", hubert_model)
+    try:
+        audio, sample_rate = torchaudio.load(audio_path)
+        audio = audio.mean(dim=0, keepdim=True)  # Convert to mono if stereo
+        if sample_rate != target_sample_rate:
+            audio = torchaudio.functional.resample(audio, sample_rate, target_sample_rate)
+        return audio.unsqueeze(0)  # Shape: (1, 1, audio_length)
+    except Exception as e:
+        print(f"Error preprocessing audio: {e}")
+        return None
