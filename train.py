@@ -2,18 +2,22 @@ import torch
 import torch.nn as nn
 import torchaudio
 from transformers import HubertModel, HubertConfig
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 import numpy as np
 import math
 from typing import Optional, List, Tuple
 from torch.utils.data import Dataset, DataLoader
 import os
-from sklearn.cluster import MiniBatchKMeans
+import logging
+from tqdm import tqdm
+import json
 
-if torch.cuda.is_available():
-    device = "cuda"
-else: 
-    device = "cpu"
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logging.info(f"Using device: {device}")
 
 class SpeechToSpeechDataset(Dataset):
     def __init__(self, 
@@ -23,8 +27,12 @@ class SpeechToSpeechDataset(Dataset):
         self.audio_dir = audio_dir
         self.sample_rate = sample_rate
         self.max_audio_length = max_audio_length
-        self.audio_files = [f for f in os.listdir(audio_dir) if f.endswith('.wav') or f.endswith('.mp3')]
-        
+        self.audio_files = [
+            f for f in os.listdir(audio_dir) 
+            if f.endswith('.wav') or f.endswith('.mp3')
+        ]
+        logging.info(f"Found {len(self.audio_files)} audio files.")
+            
     def __len__(self) -> int:
         return len(self.audio_files)
     
@@ -32,12 +40,15 @@ class SpeechToSpeechDataset(Dataset):
         audio_path = os.path.join(self.audio_dir, self.audio_files[idx])
         waveform, sample_rate = torchaudio.load(audio_path)
         
+        # Convert to mono by averaging channels if necessary
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
         
+        # Resample if needed
         if sample_rate != self.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
+            waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=self.sample_rate)(waveform)
         
+        # Pad or trim the waveform to the desired length
         if waveform.shape[1] < self.max_audio_length:
             waveform = torch.nn.functional.pad(waveform, (0, self.max_audio_length - waveform.shape[1]))
         else:
@@ -54,167 +65,278 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Te
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        position = torch.arange(max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:x.size(0)]
+        x = x + self.pe[:x.size(1)].unsqueeze(0).to(x.device)
+        return x
 
 class SpeechToSpeechLM(nn.Module):
-    def __init__(self, num_centroids: int, hidden_size: int, num_layers: int, dropout: float = 0.01):
+    def __init__(self, num_centroids: int, hidden_size: int, num_layers: int, dropout: float = 0.1):
         super(SpeechToSpeechLM, self).__init__()
         self.hubert = HubertModel(HubertConfig())
-        self.kmeans = MiniBatchKMeans(n_clusters=num_centroids, batch_size=256)
         self.embedding = nn.Embedding(num_centroids, hidden_size)
         self.positional_encoding = PositionalEncoding(hidden_size)
         
         # Encoder
-        encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=8, dropout=dropout, batch_first=True)
+        encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=8, dropout=dropout)
         self.encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
         
         # Decoder
-        decoder_layers = nn.TransformerDecoderLayer(d_model=hidden_size, nhead=8, dropout=dropout, batch_first=True)
+        decoder_layers = nn.TransformerDecoderLayer(d_model=hidden_size, nhead=8, dropout=dropout)
         self.decoder = nn.TransformerDecoder(decoder_layers, num_layers=num_layers)
         
         self.fc = nn.Linear(hidden_size, num_centroids)
+    
+    def forward(self, audio_input: torch.Tensor, 
+                target_tokens: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-
-    def process_audio(self, audio_input: torch.Tensor) -> torch.Tensor:
-        if audio_input.dim() == 3:
-            audio_input = audio_input.squeeze(1)
-        elif audio_input.dim() == 4:
-            audio_input = audio_input.squeeze(1).squeeze(1)
-
-        min_audio_length = 16000
-        if audio_input.size(1) < min_audio_length:
-            padding = min_audio_length - audio_input.size(1)
-            audio_input = torch.nn.functional.pad(audio_input, (0, padding))
-
-        features = self.hubert(audio_input).last_hidden_state
-        return features
-
-    def forward(self, audio_input: torch.Tensor, target_audio: Optional[torch.Tensor] = None) -> torch.Tensor:
-        features = self.process_audio(audio_input)
+        features = self.hubert(audio_input).last_hidden_state  # Shape: [batch, seq_len, hidden_size]
         
-        # Reshape features for clustering
-        features_2d = features.view(-1, features.size(-1)).detach().cpu().numpy()
-        
-        if self.training:
-            self.kmeans = self.kmeans.partial_fit(features_2d)
-        
-        tokens = torch.tensor(self.kmeans.predict(features_2d), device=audio_input.device, dtype=torch.long)
-        tokens = tokens.view(features.size(0), features.size(1))
-        
-        embedded = self.embedding(tokens)
+        embedded = self.embedding(target_tokens)  # Shape: [batch, seq_len, hidden_size]
         embedded = self.positional_encoding(embedded)
         
-        max_sequence_length = 1024
-        if embedded.size(1) > max_sequence_length:
-            encoder_outputs = []
-            for i in range(0, embedded.size(1), max_sequence_length):
-                chunk = embedded[:, i:i+max_sequence_length]
-                output = self.encoder(chunk)
-                encoder_outputs.append(output)
-            encoder_output = torch.cat(encoder_outputs, dim=1)
-        else:
-            encoder_output = self.encoder(embedded)
+        encoder_output = self.encoder(features)  # Shape: [batch, seq_len, hidden_size]
         
-        if self.training and target_audio is not None:
-            target_features = self.process_audio(target_audio)
-            target_features_2d = target_features.view(-1, target_features.size(-1)).detach().cpu().numpy()
-            target_tokens = torch.tensor(self.kmeans.predict(target_features_2d), 
-                                         device=audio_input.device, dtype=torch.long)
-            target_tokens = target_tokens.view(target_features.size(0), target_features.size(1))
-            
-            target_embedded = self.embedding(target_tokens)
-            target_embedded = self.positional_encoding(target_embedded)
-            
-            decoder_output = self.decoder(target_embedded, encoder_output)
+        if self.training and target_tokens is not None:
+            decoder_output = self.decoder(embedded, encoder_output)  # Shape: [batch, seq_len, hidden_size]
         else:
-            # During inference, we need to generate output step by step
-            decoder_input = torch.zeros_like(encoder_output[:, :1])
-            decoder_outputs = []
-            for i in range(encoder_output.size(1)):
-                step_output = self.decoder(decoder_input, encoder_output)
-                decoder_outputs.append(step_output)
-                decoder_input = torch.cat([decoder_input, step_output[:, -1:]], dim=1)
-            decoder_output = torch.cat(decoder_outputs, dim=1)
+            # Inference mode: autoregressive decoding
+            batch_size, seq_len, _ = encoder_output.size()
+            generated_tokens = torch.zeros(batch_size, 1, dtype=torch.long, device=audio_input.device)
+            generated_embedding = self.embedding(generated_tokens)
+            generated_embedding = self.positional_encoding(generated_embedding)
+            
+            for _ in tqdm(range(seq_len), desc="Generating tokens"):
+                decoder_output = self.decoder(generated_embedding, encoder_output)
+                logits = self.fc(decoder_output[:, -1, :])  # Shape: [batch, num_centroids]
+                predicted_tokens = torch.argmax(logits, dim=-1, keepdim=True)  # Shape: [batch, 1]
+                generated_tokens = torch.cat([generated_tokens, predicted_tokens], dim=1)
+                new_embedding = self.embedding(predicted_tokens)
+                new_embedding = self.positional_encoding(new_embedding)
+                generated_embedding = torch.cat([generated_embedding, new_embedding], dim=1)
+            
+            return generated_tokens  # Returning token sequence during inference
         
-        logits = self.fc(decoder_output)
+        logits = self.fc(decoder_output)  # Shape: [batch, seq_len, num_centroids]
         return logits
 
 def create_dataloader(audio_dir: str, 
                       batch_size: int = 32, 
                       num_workers: int = 4, 
                       sample_rate: int = 16000, 
-                      max_audio_length: int = 16000) -> DataLoader:
+                      max_audio_length: int = 16000,
+                      split: float = 0.8) -> Tuple[DataLoader, DataLoader]:
+
     dataset = SpeechToSpeechDataset(audio_dir, sample_rate, max_audio_length)
-    return DataLoader(
-        dataset,
+    train_size = int(split * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    logging.info(f"Training samples: {train_size}, Validation samples: {val_size}")
+    
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True
     )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader
+
+def precompute_kmeans(audio_dir: str, 
+                     sample_rate: int, 
+                     max_audio_length: int, 
+                     num_centroids: int,
+                     batch_size: int = 32, 
+                     num_workers: int = 4) -> MiniBatchKMeans:
+
+    dataset = SpeechToSpeechDataset(audio_dir, sample_rate, max_audio_length)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn
+    )
+    
+    hubert = HubertModel(HubertConfig()).to(device)
+    hubert.eval()
+    
+    all_features = []
+    with torch.no_grad():
+        for input_audio, _ in tqdm(dataloader, desc="Extracting features for KMeans"):
+            input_audio = input_audio.to(device)
+            features = hubert(input_audio).last_hidden_state  # Shape: [batch, seq_len, hidden_size]
+            all_features.append(features.cpu().numpy())
+    
+    all_features = np.concatenate(all_features, axis=0)  # Shape: [total_seq_len, hidden_size]
+    logging.info(f"Total features for KMeans: {all_features.shape}")
+    
+    kmeans = MiniBatchKMeans(n_clusters=num_centroids, batch_size=256, verbose=1)
+    kmeans.fit(all_features)
+    logging.info("KMeans clustering completed.")
+    
+    return kmeans
+
+def save_kmeans(kmeans: MiniBatchKMeans, filepath: str):
+
+    np.save(filepath, kmeans.cluster_centers_)
+    logging.info(f"KMeans cluster centers saved to {filepath}")
+
+def load_kmeans(filepath: str) -> MiniBatchKMeans:
+
+    centers = np.load(filepath)
+    kmeans = MiniBatchKMeans(n_clusters=centers.shape[0])
+    kmeans.cluster_centers_ = centers
+    logging.info(f"KMeans cluster centers loaded from {filepath}")
+    return kmeans
+
+def initialize_model(num_centroids: int, hidden_size: int, num_layers: int) -> SpeechToSpeechLM:
+
+    model = SpeechToSpeechLM(num_centroids=num_centroids, hidden_size=hidden_size, num_layers=num_layers).to(device)
+    logging.info("Model initialized.")
+    return model
+
+def save_model(model: SpeechToSpeechLM, kmeans: MiniBatchKMeans, model_path: str, kmeans_path: str):
+
+    torch.save(model.state_dict(), model_path)
+    save_kmeans(kmeans, kmeans_path)
+    logging.info(f"Model saved to {model_path} and KMeans to {kmeans_path}")
+
+def load_model(model: SpeechToSpeechLM, model_path: str, kmeans_path: str) -> Tuple[SpeechToSpeechLM, MiniBatchKMeans]:
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    kmeans = load_kmeans(kmeans_path)
+    model.to(device)
+    logging.info(f"Model loaded from {model_path} and KMeans from {kmeans_path}")
+    return model, kmeans
+
+def main():
+    # Configuration parameters
+    audio_dir = "/mnt/e/Speech-to-Speech-LM/data"
+    sample_rate = 16000
+    max_audio_length = 16000
+    num_centroids = 50 
+    hidden_size = 768
+    num_layers = 2
+    dropout = 0.1
+    batch_size = 8
+    num_workers = 4
+    num_epochs = 10
+    learning_rate = 1e-4
+    model_path = "speech_to_speech_model.pth"
+    kmeans_path = "kmeans_centers.npy"
 
 
+    if not os.path.exists(kmeans_path):
+        logging.info("Precomputing KMeans clustering...")
+        kmeans = precompute_kmeans(
+            audio_dir=audio_dir,
+            sample_rate=sample_rate,
+            max_audio_length=max_audio_length,
+            num_centroids=num_centroids,
+            batch_size=batch_size,
+            num_workers=num_workers
+        )
+        save_kmeans(kmeans, kmeans_path)
+    else:
+        logging.info("Loading existing KMeans clustering...")
+        kmeans = load_kmeans(kmeans_path)
+
+    
+    model = initialize_model(num_centroids=num_centroids, hidden_size=hidden_size, num_layers=num_layers)
+    
+
+    if os.path.exists(model_path):
+        logging.info("Loading existing model state...")
+        model, kmeans = load_model(model, model_path, kmeans_path)
+    
+
+    train_loader, val_loader = create_dataloader(
+        audio_dir=audio_dir,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sample_rate=sample_rate,
+        max_audio_length=max_audio_length
+    )
+    
+
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        
+        for batch in progress_bar:
+            input_audio, target_audio = batch
+            input_audio = input_audio.to(device)
+            target_audio = target_audio.to(device)
+            
+            # Forward pass
+            features = model.hubert(input_audio).last_hidden_state  # [batch, seq_len, hidden_size]
+            features_2d = features.view(-1, features.size(-1)).cpu().numpy()  # For KMeans
+            tokens = torch.tensor(kmeans.predict(features_2d), device=device, dtype=torch.long)
+            tokens = tokens.view(features.size(0), features.size(1))
+            
+            optimizer.zero_grad()
+            logits = model(input_audio, target_tokens=tokens)
+            
+            # Compute loss
+            loss = criterion(logits.view(-1, logits.size(-1)), tokens.view(-1))
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            progress_bar.set_postfix(loss=loss.item())
+        
+        avg_loss = total_loss / len(train_loader)
+        logging.info(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
+        
+        # Optional: Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                input_audio, target_audio = batch
+                input_audio = input_audio.to(device)
+                target_audio = target_audio.to(device)
+                
+                features = model.hubert(input_audio).last_hidden_state
+                features_2d = features.view(-1, features.size(-1)).cpu().numpy()
+                tokens = torch.tensor(kmeans.predict(features_2d), device=device, dtype=torch.long)
+                tokens = tokens.view(features.size(0), features.size(1))
+                
+                logits = model(input_audio, target_tokens=tokens)
+                loss = criterion(logits.view(-1, logits.size(-1)), tokens.view(-1))
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        logging.info(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}")
+        
+        # Save the model after each epoch
+        save_model(model, kmeans, model_path, kmeans_path)
+    
+    logging.info("Training completed.")
 
 if __name__ == "__main__":
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
-
-        # Reduce the number of centroids to match the dataset size
-        num_centroids = 49  # Changed from 100 to 50
-
-        model = SpeechToSpeechLM(num_centroids=num_centroids, hidden_size=768, num_layers=1).to(device)
-
-        dataloader = create_dataloader(
-            audio_dir="/mnt/e/Speech-to-Speech-LM/data",
-            batch_size=8,  # Increased from 1 to 8
-            num_workers=4,
-            sample_rate=16000,
-            max_audio_length=16000
-        )
-
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-        num_epochs = 10
-        for epoch in range(num_epochs):
-            model.train()
-            total_loss = 0
-            for batch in dataloader:
-                input_audio, target_audio = batch
-                input_audio, target_audio = input_audio.to(device), target_audio.to(device)
-                
-                optimizer.zero_grad()
-                
-                output = model(input_audio, target_audio)
-                
-                with torch.no_grad():
-                    target_features = model.process_audio(target_audio)
-                    target_features_2d = target_features.view(-1, target_features.size(-1)).cpu().numpy()
-                    target_tokens = torch.tensor(model.kmeans.predict(target_features_2d), 
-                                                 device=device, dtype=torch.long)
-                    target_tokens = target_tokens.view(target_features.size(0), target_features.size(1))
-                
-                loss = criterion(output.view(-1, output.size(-1)), target_tokens.view(-1))
-                
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-            
-            avg_loss = total_loss / len(dataloader)
-            print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
-
-        torch.save(model.state_dict(), "speech_to_speech_model.pth")
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    main()
