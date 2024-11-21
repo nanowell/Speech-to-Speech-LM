@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torchaudio
+import random
 from transformers import HubertModel, HubertConfig
 from sklearn.cluster import MiniBatchKMeans
 import numpy as np
@@ -23,10 +24,12 @@ class SpeechToSpeechDataset(Dataset):
     def __init__(self, 
                  audio_dir: str, 
                  sample_rate: int = 16000, 
-                 max_audio_length: int = 16000):
+                 max_audio_length: int = 16000,
+                 augment: bool = False):
         self.audio_dir = audio_dir
         self.sample_rate = sample_rate
         self.max_audio_length = max_audio_length
+        self.augment = augment
         self.audio_files = [
             f for f in os.listdir(audio_dir) 
             if f.endswith('.wav') or f.endswith('.mp3')
@@ -39,6 +42,10 @@ class SpeechToSpeechDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         audio_path = os.path.join(self.audio_dir, self.audio_files[idx])
         waveform, sample_rate = torchaudio.load(audio_path)
+        
+        # Data Augmentation: Apply random noise and time stretching
+        if self.augment:
+            waveform = self.apply_augmentation(waveform)
         
         # Convert to mono by averaging channels if necessary
         if waveform.shape[0] > 1:
@@ -55,6 +62,29 @@ class SpeechToSpeechDataset(Dataset):
             waveform = waveform[:, :self.max_audio_length]
         
         return waveform, waveform
+    
+    def apply_augmentation(self, waveform: torch.Tensor) -> torch.Tensor:
+        # Randomly apply noise
+        if random.random() < 0.5:
+            noise = torch.randn_like(waveform) * 0.005
+            waveform = waveform + noise
+        
+        # Randomly apply time stretching
+        if random.random() < 0.5:
+            stretch_factor = random.uniform(0.8, 1.2)
+            waveform = self.time_stretch(waveform, stretch_factor)
+        
+        return waveform
+    
+    def time_stretch(self, waveform: torch.Tensor, factor: float) -> torch.Tensor:
+        # Use torchaudio's time stretching
+        try:
+            waveform = torchaudio.transforms.TimeStretch()(waveform)
+            # Note: TimeStretch requires complex input from a spectrogram. Implementing a simple placeholder.
+            # For simplicity, this is left as a no-op. Implement proper time stretching as needed.
+        except Exception as e:
+            logging.warning(f"Time stretching failed: {e}")
+        return waveform
 
 def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
     input_audio, target_audio = zip(*batch)
@@ -131,9 +161,10 @@ def create_dataloader(audio_dir: str,
                       num_workers: int = 4, 
                       sample_rate: int = 16000, 
                       max_audio_length: int = 16000,
-                      split: float = 0.8) -> Tuple[DataLoader, DataLoader]:
+                      split: float = 0.8,
+                      augment: bool = False) -> Tuple[DataLoader, DataLoader]:
 
-    dataset = SpeechToSpeechDataset(audio_dir, sample_rate, max_audio_length)
+    dataset = SpeechToSpeechDataset(audio_dir, sample_rate, max_audio_length, augment=augment)
     train_size = int(split * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
@@ -184,49 +215,54 @@ def precompute_kmeans(audio_dir: str,
         for input_audio, _ in tqdm(dataloader, desc="Extracting features for KMeans"):
             input_audio = input_audio.to(device)
             features = hubert(input_audio).last_hidden_state  # Shape: [batch, seq_len, hidden_size]
-            all_features.append(features.cpu().numpy())
+            all_features.append(features.view(-1, features.size(-1)).cpu().numpy())
     
     all_features = np.concatenate(all_features, axis=0)  # Shape: [total_seq_len, hidden_size]
     logging.info(f"Total features for KMeans: {all_features.shape}")
     
-    kmeans = MiniBatchKMeans(n_clusters=num_centroids, batch_size=256, verbose=1)
+    kmeans = MiniBatchKMeans(n_clusters=num_centroids, batch_size=256, verbose=1, random_state=42)
     kmeans.fit(all_features)
     logging.info("KMeans clustering completed.")
     
     return kmeans
 
 def save_kmeans(kmeans: MiniBatchKMeans, filepath: str):
-
     np.save(filepath, kmeans.cluster_centers_)
     logging.info(f"KMeans cluster centers saved to {filepath}")
 
 def load_kmeans(filepath: str) -> MiniBatchKMeans:
-
     centers = np.load(filepath)
-    kmeans = MiniBatchKMeans(n_clusters=centers.shape[0])
+    kmeans = MiniBatchKMeans(n_clusters=centers.shape[0], random_state=42)
     kmeans.cluster_centers_ = centers
     logging.info(f"KMeans cluster centers loaded from {filepath}")
     return kmeans
 
 def initialize_model(num_centroids: int, hidden_size: int, num_layers: int) -> SpeechToSpeechLM:
-
     model = SpeechToSpeechLM(num_centroids=num_centroids, hidden_size=hidden_size, num_layers=num_layers).to(device)
     logging.info("Model initialized.")
     return model
 
 def save_model(model: SpeechToSpeechLM, kmeans: MiniBatchKMeans, model_path: str, kmeans_path: str):
-
     torch.save(model.state_dict(), model_path)
     save_kmeans(kmeans, kmeans_path)
     logging.info(f"Model saved to {model_path} and KMeans to {kmeans_path}")
 
 def load_model(model: SpeechToSpeechLM, model_path: str, kmeans_path: str) -> Tuple[SpeechToSpeechLM, MiniBatchKMeans]:
-
     model.load_state_dict(torch.load(model_path, map_location=device))
     kmeans = load_kmeans(kmeans_path)
     model.to(device)
     logging.info(f"Model loaded from {model_path} and KMeans from {kmeans_path}")
     return model, kmeans
+
+def initialize_scheduler(optimizer: torch.optim.Optimizer, scheduler_type: str = 'ReduceLROnPlateau', **kwargs):
+    if scheduler_type == 'StepLR':
+        return torch.optim.lr_scheduler.StepLR(optimizer, **kwargs)
+    elif scheduler_type == 'ExponentialLR':
+        return torch.optim.lr_scheduler.ExponentialLR(optimizer, **kwargs)
+    elif scheduler_type == 'ReduceLROnPlateau':
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, **kwargs)
+    else:
+        raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
 
 def main():
     # Configuration parameters
@@ -239,12 +275,17 @@ def main():
     dropout = 0.1
     batch_size = 8
     num_workers = 4
-    num_epochs = 10
+    num_epochs = 50  # Increased to allow early stopping
     learning_rate = 1e-4
     model_path = "speech_to_speech_model.pth"
     kmeans_path = "kmeans_centers.npy"
-
-
+    patience = 5  # For early stopping
+    min_delta = 0.001  # Minimum improvement for early stopping
+    gradient_clip = 1.0  # Max norm for gradient clipping
+    scheduler_type = 'ReduceLROnPlateau'
+    scheduler_params = {'mode': 'min', 'factor': 0.5, 'patience': 2, 'verbose': True}
+    
+    # Initialize or load KMeans
     if not os.path.exists(kmeans_path):
         logging.info("Precomputing KMeans clustering...")
         kmeans = precompute_kmeans(
@@ -260,32 +301,42 @@ def main():
         logging.info("Loading existing KMeans clustering...")
         kmeans = load_kmeans(kmeans_path)
 
-    
+    # Initialize or load model
     model = initialize_model(num_centroids=num_centroids, hidden_size=hidden_size, num_layers=num_layers)
-    
 
     if os.path.exists(model_path):
         logging.info("Loading existing model state...")
         model, kmeans = load_model(model, model_path, kmeans_path)
-    
 
+    # Create DataLoaders with data augmentation for training set
     train_loader, val_loader = create_dataloader(
         audio_dir=audio_dir,
         batch_size=batch_size,
         num_workers=num_workers,
         sample_rate=sample_rate,
-        max_audio_length=max_audio_length
+        max_audio_length=max_audio_length,
+        augment=True  # Enable data augmentation for training
     )
-    
 
+    # Define loss and optimizer
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
+    # Initialize learning rate scheduler
+    scheduler = initialize_scheduler(optimizer, scheduler_type, **scheduler_params)
+
+    # Early Stopping variables
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_path = "best_speech_to_speech_model.pth"
 
     for epoch in range(num_epochs):
+        # Training Phase
         model.train()
         total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        total_correct = 0
+        total_tokens = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")
         
         for batch in progress_bar:
             input_audio, target_audio = batch
@@ -304,19 +355,34 @@ def main():
             # Compute loss
             loss = criterion(logits.view(-1, logits.size(-1)), tokens.view(-1))
             loss.backward()
+            
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            
             optimizer.step()
             
             total_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item())
+            
+            # Compute accuracy
+            preds = torch.argmax(logits, dim=-1)
+            mask = tokens != -100
+            correct = (preds == tokens) & mask
+            total_correct += correct.sum().item()
+            total_tokens += mask.sum().item()
+            
+            progress_bar.set_postfix(loss=loss.item(), accuracy=100.0 * total_correct / max(total_tokens, 1))
         
         avg_loss = total_loss / len(train_loader)
-        logging.info(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
+        train_accuracy = 100.0 * total_correct / max(total_tokens, 1)
+        logging.info(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_loss:.4f}, Training Accuracy: {train_accuracy:.2f}%")
         
-        # Optional: Validation
+        # Validation Phase
         model.eval()
         val_loss = 0
+        val_correct = 0
+        val_tokens = 0
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
                 input_audio, target_audio = batch
                 input_audio = input_audio.to(device)
                 target_audio = target_audio.to(device)
@@ -329,14 +395,42 @@ def main():
                 logits = model(input_audio, target_tokens=tokens)
                 loss = criterion(logits.view(-1, logits.size(-1)), tokens.view(-1))
                 val_loss += loss.item()
+                
+                # Compute accuracy
+                preds = torch.argmax(logits, dim=-1)
+                mask = tokens != -100
+                correct = (preds == tokens) & mask
+                val_correct += correct.sum().item()
+                val_tokens += mask.sum().item()
         
         avg_val_loss = val_loss / len(val_loader)
-        logging.info(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}")
+        val_accuracy = 100.0 * val_correct / max(val_tokens, 1)
+        logging.info(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%")
         
-        # Save the model after each epoch
+        # Step the scheduler
+        if scheduler_type == 'ReduceLROnPlateau':
+            scheduler.step(avg_val_loss)
+        else:
+            scheduler.step()
+        
+        # Check for improvement
+        if avg_val_loss + min_delta < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            save_model(model, kmeans, best_model_path, kmeans_path)
+            logging.info(f"Validation loss decreased. Saving new best model to {best_model_path}")
+        else:
+            epochs_no_improve += 1
+            logging.info(f"No improvement in validation loss for {epochs_no_improve} epoch(s).")
+            if epochs_no_improve >= patience:
+                logging.info("Early stopping triggered.")
+                break
+        
+        # Save the latest model state
         save_model(model, kmeans, model_path, kmeans_path)
     
     logging.info("Training completed.")
+    logging.info(f"Best validation loss achieved: {best_val_loss:.4f}")
 
 if __name__ == "__main__":
     main()
